@@ -14,8 +14,7 @@ import struct
 import sys
 import zipfile
 
-OLD_NAME = ".App"
-NEW_NAME = ".New"
+NAME_PAIRS = ((".App", ".New"), ("com.fongmi.android.tv.App", "com.fongmi.android.tv.New"))
 SIGNATURE_SUFFIXES = (".SF", ".RSA", ".DSA", ".EC")
 
 
@@ -71,36 +70,31 @@ def patch_binary_manifest(data: bytes) -> bytes:
             flags = u32(patched, offset + 16)
             strings_start = u32(patched, offset + 20)
             utf8 = bool(flags & 0x00000100)
-            old_bytes = OLD_NAME.encode("utf-8") if utf8 else OLD_NAME.encode("utf-16le")
-            new_bytes = NEW_NAME.encode("utf-8") if utf8 else NEW_NAME.encode("utf-16le")
-
             for index in range(string_count):
                 string_offset = u32(patched, offset + header_size + index * 4)
                 pos = offset + strings_start + string_offset
                 if utf8:
-                    _utf16_length, pos = read_len8(patched, pos)
+                    char_length, pos = read_len8(patched, pos)
                     byte_length, pos = read_len8(patched, pos)
                     value_pos = pos
                 else:
-                    _char_length, value_pos = read_len16(patched, pos)
-                    byte_length = len(old_bytes)
+                    char_length, value_pos = read_len16(patched, pos)
+                    byte_length = char_length * 2
 
-                if bytes(patched[value_pos:value_pos + byte_length]) == old_bytes:
-                    if len(old_bytes) != len(new_bytes):
-                        raise ValueError("Replacement must be equal length")
-                    patched[value_pos:value_pos + byte_length] = new_bytes
-                    replacements += 1
+                for old_name, new_name in NAME_PAIRS:
+                    old_bytes = old_name.encode("utf-8") if utf8 else old_name.encode("utf-16le")
+                    new_bytes = new_name.encode("utf-8") if utf8 else new_name.encode("utf-16le")
+                    if char_length == len(old_name) and byte_length == len(old_bytes) and bytes(patched[value_pos:value_pos + byte_length]) == old_bytes:
+                        if len(old_bytes) != len(new_bytes):
+                            raise ValueError("Replacement must be equal length")
+                        patched[value_pos:value_pos + byte_length] = new_bytes
+                        replacements += 1
+                        break
 
         offset += chunk_size
 
     if replacements < 1:
         raise ValueError(f"Could not find exact manifest string {OLD_NAME!r} in AXML string pool")
-    check_old = OLD_NAME.encode("utf-8")
-    check_new = NEW_NAME.encode("utf-8")
-    if check_old in patched and check_old not in check_new:
-        # It is possible for a different longer string to contain the sequence;
-        # the string-pool entries were patched exactly, so this is only a guard.
-        pass
     return bytes(patched)
 
 
@@ -178,7 +172,13 @@ def main() -> None:
         if missing:
             raise SystemExit("Missing after injection: " + ", ".join(missing))
         manifest_after = check.read("AndroidManifest.xml")
-        if NEW_NAME.encode("utf-8") not in manifest_after and NEW_NAME.encode("utf-16le") not in manifest_after:
+        replacements_present = (
+            b".New" in manifest_after
+            or "com.fongmi.android.tv.New".encode("utf-8") in manifest_after
+            or ".New".encode("utf-16le") in manifest_after
+            or "com.fongmi.android.tv.New".encode("utf-16le") in manifest_after
+        )
+        if not replacements_present:
             raise SystemExit("Bootstrap Application class was not written")
 
     print(f"Injected {len(assets)} resource files and {dex_name}")
