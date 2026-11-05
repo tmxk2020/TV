@@ -28,23 +28,19 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK build tools
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-35 build-tools;35.0.0'
 
-      - name: Install Apktool
+      - name: Verify binary manifest patcher
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 --retry-delay 2 \
-            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar \
-            -o "$RUNNER_TEMP/apktool.jar"
-          printf '#!/usr/bin/env bash\nexec java -jar "%s" "$@"\n' "$RUNNER_TEMP/apktool.jar" > "$RUNNER_TEMP/apktool"
-          chmod +x "$RUNNER_TEMP/apktool"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          python3 -m py_compile scripts/inject_apk.py scripts/test_inject_apk.py
+          (cd scripts && python3 test_inject_apk.py)
 
-      - name: Reassemble and verify embedded TMXK payload
+      - name: Assemble and verify embedded TMXK payload
         shell: bash
         run: |
           set -euo pipefail
@@ -100,26 +96,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/java-src/com/fongmi/android/tv" \
-                   "$RUNNER_TEMP/java-src/com/tmxk/bootstrap" \
                    "$RUNNER_TEMP/java-classes" "$RUNNER_TEMP/new-dex"
           cp tmxk/src/AppCompileStub.java "$RUNNER_TEMP/java-src/com/fongmi/android/tv/App.java"
-          cp tmxk/src/TMXKApplication.java "$RUNNER_TEMP/java-src/com/tmxk/bootstrap/TMXKApplication.java"
+          cp tmxk/src/New.java "$RUNNER_TEMP/java-src/com/fongmi/android/tv/New.java"
           javac -encoding UTF-8 -source 8 -target 8 \
             -bootclasspath "$ANDROID_HOME/platforms/android-35/android.jar" \
             -d "$RUNNER_TEMP/java-classes" \
             "$RUNNER_TEMP/java-src/com/fongmi/android/tv/App.java" \
-            "$RUNNER_TEMP/java-src/com/tmxk/bootstrap/TMXKApplication.java"
-          "$ANDROID_HOME/build-tools/35.0.0/d8" --min-api 23 \
+            "$RUNNER_TEMP/java-src/com/fongmi/android/tv/New.java"
+          "$ANDROID_HOME/build-tools/35.0.0/d8" --min-api 24 \
             --lib "$ANDROID_HOME/platforms/android-35/android.jar" \
             --output "$RUNNER_TEMP/new-dex" \
-            "$RUNNER_TEMP/java-classes/com/tmxk/bootstrap/TMXKApplication.class"
+            "$RUNNER_TEMP/java-classes/com/fongmi/android/tv/New.class"
           test -s "$RUNNER_TEMP/new-dex/classes.dex"
-          if jar tf "$RUNNER_TEMP/new-dex/classes.dex" >/dev/null 2>&1; then
-            echo "Unexpected JAR output for DEX" >&2
-            exit 1
-          fi
 
-      - name: Repack, align, sign and verify both variants
+      - name: Inject assets and bootstrap into both official APKs
         shell: bash
         env:
           KEYSTORE_PASS: ${{ secrets.TMXK_KEYSTORE_PASS || 'tmxk-temporary-build-key' }}
@@ -128,39 +119,16 @@ jobs:
           mkdir -p dist
           for variant in mobile leanback; do
             original="$RUNNER_TEMP/${variant}-official.apk"
-            decoded="$RUNNER_TEMP/decoded-${variant}"
-            rebuilt="$RUNNER_TEMP/rebuilt-${variant}.apk"
-            merged="$RUNNER_TEMP/merged-${variant}.apk"
+            injected="$RUNNER_TEMP/injected-${variant}.apk"
             aligned="$RUNNER_TEMP/aligned-${variant}.apk"
             signed="dist/TMXK-FongMi-5.8.7-${variant}-arm64.apk"
 
-            "$RUNNER_TEMP/apktool" d --no-src --force "$original" --output "$decoded"
-            python3 scripts/patch_manifest.py "$decoded/AndroidManifest.xml"
+            python3 scripts/inject_apk.py \
+              "$original" "$injected" "$RUNNER_TEMP/tmxk-assets" "$RUNNER_TEMP/new-dex/classes.dex"
 
-            mkdir -p "$decoded/assets/tmxk"
-            cp -a "$RUNNER_TEMP/tmxk-assets/." "$decoded/assets/tmxk/"
+            "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -f 4 "$injected" "$aligned"
+            "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 4 "$aligned"
 
-            "$RUNNER_TEMP/apktool" b "$decoded" --output "$rebuilt"
-
-            dex_index=$(python3 - "$rebuilt" <<'PY'
-          import re, sys, zipfile
-          with zipfile.ZipFile(sys.argv[1]) as apk:
-              names = apk.namelist()
-          indexes = []
-          for name in names:
-              match = re.fullmatch(r"classes(\d*)\.dex", name)
-              if match:
-                  indexes.append(int(match.group(1) or "1"))
-          if not indexes:
-              raise SystemExit("No original classes*.dex found after Apktool rebuild")
-          print(max(indexes) + 1)
-          PY
-          )
-            cp "$RUNNER_TEMP/new-dex/classes.dex" "$RUNNER_TEMP/classes${dex_index}.dex"
-            cp "$rebuilt" "$merged"
-            (cd "$RUNNER_TEMP" && zip -q "$merged" "classes${dex_index}.dex")
-
-            "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f 4 "$merged" "$aligned"
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
               --ks "$RUNNER_TEMP/tmxk-release.jks" --ks-key-alias tmxk \
               --ks-pass "pass:$KEYSTORE_PASS" --key-pass "pass:$KEYSTORE_PASS" \
@@ -171,12 +139,15 @@ jobs:
             grep -q "versionCode='587'" "$RUNNER_TEMP/${variant}-badging.txt"
             grep -q "versionName='5.8.7'" "$RUNNER_TEMP/${variant}-badging.txt"
             grep -q "name='com.fongmi.android.tv'" "$RUNNER_TEMP/${variant}-badging.txt"
+
             python3 - "$signed" <<'PY'
           import sys, zipfile
           with zipfile.ZipFile(sys.argv[1]) as apk:
               names = set(apk.namelist())
+              manifest = apk.read("AndroidManifest.xml")
           required = [
               "assets/tmxk/config.json",
+              "assets/tmxk/game-live-vod.json",
               "assets/tmxk/live/cctv.py",
               "assets/tmxk/live/yangshipin.py",
               "assets/tmxk/live/gdtv.py",
@@ -185,12 +156,13 @@ jobs:
           missing = [p for p in required if p not in names]
           if missing:
               raise SystemExit("APK missing embedded payload: " + ", ".join(missing))
-          dex = [n for n in names if n.startswith("classes") and n.endswith(".dex")]
-          if len(dex) < 2:
+          if not any(n.startswith("classes") and n.endswith(".dex") and n != "classes.dex" for n in names):
               raise SystemExit("Bootstrap DEX was not added")
-          print("Verified payload and DEX in", sys.argv[1])
+          if b".New" not in manifest and b"com.fongmi.android.tv.New" not in manifest:
+              if ".New".encode("utf-16le") not in manifest and "com.fongmi.android.tv.New".encode("utf-16le") not in manifest:
+                  raise SystemExit("Bootstrap Application class is not in AndroidManifest.xml")
+          print("Verified package manifest, TMXK resources and bootstrap DEX:", sys.argv[1])
           PY
-            rm -rf "$decoded"
           done
 
           sha256sum dist/*.apk > dist/SHA256SUMS.txt
@@ -200,7 +172,7 @@ jobs:
           电视版：TMXK-FongMi-5.8.7-leanback-arm64.apk
 
           首次启动自动注册饭太硬点播、TMXK 内置直播、TMXK 游戏直播。
-          内置直播含央视频、央视官网、广东广电；脚本和 JSON 均在 APK assets 内。
+          内置直播含央视频、央视官网、广东广电；Python 脚本和 JSON 均在 APK assets 内。
           请在「设置 → 模块」中安装官方对应架构的 Python 1.1.3、QuickJS 1.1.0、MPV 1.1.0 等模块。
 
           注意：本包包名与官方版相同，但签名不同，不能覆盖安装。
