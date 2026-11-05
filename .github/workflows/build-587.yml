@@ -1,0 +1,229 @@
+name: TMXK FongMi 5.8.7 APK Build
+
+on:
+  push:
+    branches:
+      - tmxk-5.8.7-prefilled-20261105
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tmxk-fongmi-587-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  repack:
+    name: Repack official 5.8.7 (mobile + leanback)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout TMXK build branch
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      - name: Install Apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar \
+            -o "$RUNNER_TEMP/apktool.jar"
+          printf '#!/usr/bin/env bash\nexec java -jar "%s" "$@"\n' "$RUNNER_TEMP/apktool.jar" > "$RUNNER_TEMP/apktool"
+          chmod +x "$RUNNER_TEMP/apktool"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Reassemble and verify embedded TMXK payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tmxk-assets"
+          cat payload/part*.b64 > "$RUNNER_TEMP/payload.tar.xz.b64"
+          test "$(wc -c < "$RUNNER_TEMP/payload.tar.xz.b64")" -eq 57212
+          base64 --decode "$RUNNER_TEMP/payload.tar.xz.b64" > "$RUNNER_TEMP/payload.tar.xz"
+          echo "1a4ed592aac41b853dafbc80cf7f8155a9fef405668399954bd1a96441ef66ea  $RUNNER_TEMP/payload.tar.xz" | sha256sum --check -
+          tar -tJf "$RUNNER_TEMP/payload.tar.xz" >/dev/null
+          tar -xJf "$RUNNER_TEMP/payload.tar.xz" -C "$RUNNER_TEMP/tmxk-assets"
+          test -s "$RUNNER_TEMP/tmxk-assets/config.json"
+          test -s "$RUNNER_TEMP/tmxk-assets/live/cctv.py"
+          test -s "$RUNNER_TEMP/tmxk-assets/live/yangshipin.py"
+          test -s "$RUNNER_TEMP/tmxk-assets/live/gdtv.py"
+          test -s "$RUNNER_TEMP/tmxk-assets/vod/game_live.py"
+          python3 - "$RUNNER_TEMP/tmxk-assets" <<'PY'
+          import ast, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          for p in root.rglob("*.json"):
+              json.loads(p.read_text(encoding="utf-8"))
+          for p in root.rglob("*.py"):
+              ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+          print("Embedded JSON and Python syntax checks passed")
+          PY
+
+      - name: Create temporary signing key
+        shell: bash
+        env:
+          KEYSTORE_PASS: ${{ secrets.TMXK_KEYSTORE_PASS || 'tmxk-temporary-build-key' }}
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/tmxk-release.jks" \
+            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
+            -alias tmxk -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=TMXK, OU=Build, O=TMXK, L=Internet, ST=NA, C=US"
+
+      - name: Download pinned official FongMi 5.8.7 APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/FongMi/Release/releases/download/5.8.7/mobile-arm64_v8a.apk \
+            -o "$RUNNER_TEMP/mobile-official.apk"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/FongMi/Release/releases/download/5.8.7/leanback-arm64_v8a.apk \
+            -o "$RUNNER_TEMP/leanback-official.apk"
+          echo "449867339299838303b5be19c92288756e3d88bf0ea3f8a9dab1abb75696d85a  $RUNNER_TEMP/mobile-official.apk" | sha256sum --check -
+          echo "cda5776ba2ee6f7dfdcd3d7c1a13095ba8672b9892d6fb9e1ba38f993ad66f3a  $RUNNER_TEMP/leanback-official.apk" | sha256sum --check -
+
+      - name: Compile bootstrap DEX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/java-src/com/fongmi/android/tv" \
+                   "$RUNNER_TEMP/java-src/com/tmxk/bootstrap" \
+                   "$RUNNER_TEMP/java-classes" "$RUNNER_TEMP/new-dex"
+          cp tmxk/src/AppCompileStub.java "$RUNNER_TEMP/java-src/com/fongmi/android/tv/App.java"
+          cp tmxk/src/TMXKApplication.java "$RUNNER_TEMP/java-src/com/tmxk/bootstrap/TMXKApplication.java"
+          javac -encoding UTF-8 -source 8 -target 8 \
+            -bootclasspath "$ANDROID_HOME/platforms/android-35/android.jar" \
+            -d "$RUNNER_TEMP/java-classes" \
+            "$RUNNER_TEMP/java-src/com/fongmi/android/tv/App.java" \
+            "$RUNNER_TEMP/java-src/com/tmxk/bootstrap/TMXKApplication.java"
+          "$ANDROID_HOME/build-tools/35.0.0/d8" --min-api 23 \
+            --lib "$ANDROID_HOME/platforms/android-35/android.jar" \
+            --output "$RUNNER_TEMP/new-dex" \
+            "$RUNNER_TEMP/java-classes/com/tmxk/bootstrap/TMXKApplication.class"
+          test -s "$RUNNER_TEMP/new-dex/classes.dex"
+          if jar tf "$RUNNER_TEMP/new-dex/classes.dex" >/dev/null 2>&1; then
+            echo "Unexpected JAR output for DEX" >&2
+            exit 1
+          fi
+
+      - name: Repack, align, sign and verify both variants
+        shell: bash
+        env:
+          KEYSTORE_PASS: ${{ secrets.TMXK_KEYSTORE_PASS || 'tmxk-temporary-build-key' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for variant in mobile leanback; do
+            original="$RUNNER_TEMP/${variant}-official.apk"
+            decoded="$RUNNER_TEMP/decoded-${variant}"
+            rebuilt="$RUNNER_TEMP/rebuilt-${variant}.apk"
+            merged="$RUNNER_TEMP/merged-${variant}.apk"
+            aligned="$RUNNER_TEMP/aligned-${variant}.apk"
+            signed="dist/TMXK-FongMi-5.8.7-${variant}-arm64.apk"
+
+            "$RUNNER_TEMP/apktool" d --no-src --force "$original" --output "$decoded"
+            python3 scripts/patch_manifest.py "$decoded/AndroidManifest.xml"
+
+            mkdir -p "$decoded/assets/tmxk"
+            cp -a "$RUNNER_TEMP/tmxk-assets/." "$decoded/assets/tmxk/"
+
+            "$RUNNER_TEMP/apktool" b "$decoded" --output "$rebuilt"
+
+            dex_index=$(python3 - "$rebuilt" <<'PY'
+          import re, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              names = apk.namelist()
+          indexes = []
+          for name in names:
+              match = re.fullmatch(r"classes(\d*)\.dex", name)
+              if match:
+                  indexes.append(int(match.group(1) or "1"))
+          if not indexes:
+              raise SystemExit("No original classes*.dex found after Apktool rebuild")
+          print(max(indexes) + 1)
+          PY
+          )
+            cp "$RUNNER_TEMP/new-dex/classes.dex" "$RUNNER_TEMP/classes${dex_index}.dex"
+            cp "$rebuilt" "$merged"
+            (cd "$RUNNER_TEMP" && zip -q "$merged" "classes${dex_index}.dex")
+
+            "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f 4 "$merged" "$aligned"
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+              --ks "$RUNNER_TEMP/tmxk-release.jks" --ks-key-alias tmxk \
+              --ks-pass "pass:$KEYSTORE_PASS" --key-pass "pass:$KEYSTORE_PASS" \
+              --out "$signed" "$aligned"
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$signed"
+
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$signed" > "$RUNNER_TEMP/${variant}-badging.txt"
+            grep -q "versionCode='587'" "$RUNNER_TEMP/${variant}-badging.txt"
+            grep -q "versionName='5.8.7'" "$RUNNER_TEMP/${variant}-badging.txt"
+            grep -q "name='com.fongmi.android.tv'" "$RUNNER_TEMP/${variant}-badging.txt"
+            python3 - "$signed" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              names = set(apk.namelist())
+          required = [
+              "assets/tmxk/config.json",
+              "assets/tmxk/live/cctv.py",
+              "assets/tmxk/live/yangshipin.py",
+              "assets/tmxk/live/gdtv.py",
+              "assets/tmxk/vod/game_live.py",
+          ]
+          missing = [p for p in required if p not in names]
+          if missing:
+              raise SystemExit("APK missing embedded payload: " + ", ".join(missing))
+          dex = [n for n in names if n.startswith("classes") and n.endswith(".dex")]
+          if len(dex) < 2:
+              raise SystemExit("Bootstrap DEX was not added")
+          print("Verified payload and DEX in", sys.argv[1])
+          PY
+            rm -rf "$decoded"
+          done
+
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt
+          cat > dist/安装说明.txt <<'TXT'
+          TMXK FongMi 5.8.7 内置配置版
+          手机版：TMXK-FongMi-5.8.7-mobile-arm64.apk
+          电视版：TMXK-FongMi-5.8.7-leanback-arm64.apk
+
+          首次启动自动注册饭太硬点播、TMXK 内置直播、TMXK 游戏直播。
+          内置直播含央视频、央视官网、广东广电；脚本和 JSON 均在 APK assets 内。
+          请在「设置 → 模块」中安装官方对应架构的 Python 1.1.3、QuickJS 1.1.0、MPV 1.1.0 等模块。
+
+          注意：本包包名与官方版相同，但签名不同，不能覆盖安装。
+          请先备份原应用数据、卸载官方签名版，再安装本包。
+          此构建使用临时签名密钥；以后再次构建可能需要卸载旧的 TMXK 版本。
+          Python Spider 运行依赖（例如 pycryptodome、lxml、pywasm）仍需在真实设备上验收。
+          TXT
+
+      - name: Upload APKs as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMXK-FongMi-5.8.7-APKs
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish downloadable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="tmxk-5.8.7-build-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" dist/* \
+            --title "TMXK FongMi 5.8.7 APK #${GITHUB_RUN_NUMBER}" \
+            --notes "Repacked from official FongMi 5.8.7 arm64 mobile and leanback APKs. Built-in VOD/live sources and Python Spider assets. Different signing certificate: uninstall official build first. Runtime Spider dependencies need real-device validation."
