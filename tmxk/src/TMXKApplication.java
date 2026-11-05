@@ -1,9 +1,7 @@
 package com.tmxk.bootstrap;
 
 import android.app.ActivityManager;
-import android.app.Application;
 import android.content.Context;
-import android.os.Build;
 import android.os.Process;
 import android.util.Log;
 
@@ -64,10 +62,6 @@ public final class TMXKApplication extends App {
 
     private boolean isMainProcess() {
         String packageName = getPackageName();
-        if (Build.VERSION.SDK_INT >= 28) {
-            return packageName.equals(Application.getProcessName());
-        }
-
         ActivityManager manager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
         List<ActivityManager.RunningAppProcessInfo> processes =
                 manager == null ? null : manager.getRunningAppProcesses();
